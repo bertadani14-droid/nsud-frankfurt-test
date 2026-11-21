@@ -1,0 +1,14 @@
+BREMEN (HB) KAPCSOLATI TESZT – A MEGLEVO RENDER PROGRAM FRISSITESE
+
+1) GitHub: https://github.com/bertadani14-droid/nsud-frankfurt-test
+2) Kattints a server.js fajlra. Jobb felul ceruza (Edit this file).
+3) A teljes regi server.js tartalmat csereld a csomag server.js tartalmara.
+4) Jobb felul Commit changes, majd ismet Commit changes.
+5) Render automatikus frissites lehet, de a Public Git Repository deployment beallitasatol fugg.
+   Ha nem tortenik uj deploy: Render > nsud-frankfurt-test > Manual Deploy > Deploy latest commit.
+6) Ellenorizd, hogy a szolgaltatas Free ($0/month) es Frankfurt regioban fut.
+7) Uj jelentés: https://nsud-frankfurt-test.onrender.com/bremen
+8) A regi jelentés valtozatlanul: https://nsud-frankfurt-test.onrender.com/report
+
+Megjegyzes: nem futtathato tesztlink, amig a GitHub-on nem frissited a server.js fajlt,
+es a Render nem telepiti az uj verziót. A teszt nem nyitott proxy es nem fogad kulso URL-parametert.

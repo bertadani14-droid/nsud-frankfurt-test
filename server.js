@@ -12,18 +12,38 @@ const targets = [
   ['NSSR_F018_PDF', 'https://www.nsud.sk/data/att/659/873803.b15efc.pdf'],
   ['NSSR_HTTP_CONTROL', 'http://www.nsud.sk/'],
   ['JUSTICE_HTTPS_CONTROL', 'https://www.justice.gov.sk/'],
+  // Bremen (HB) endpoints read from NEMET_TARTOMANYOK.gs v1.5.9.
+  ['HB_NORM_PORTAL', 'https://www.transparenz.bremen.de/vorschriften-72741'],
+  ['HB_NORM_SEARCH', 'https://www.transparenz.bremen.de/vorschriften-72741?id=72743&gsid=kogis_tp_berlin01.c.60176.de&_article_id=72743&fulltext=Bremische%20Landesverfassung&fileCnt=on&skip=0&max=50'],
+  ['HB_OVG_CASE_LIST', 'https://www.oberverwaltungsgericht.bremen.de/entscheidungen/entscheidungsuebersicht-11265?max=100&skip=0'],
+  ['HB_NORM_HTTP_CONTROL', 'http://www.transparenz.bremen.de/vorschriften-72741'],
+  ['HB_OVG_HTTP_CONTROL', 'http://www.oberverwaltungsgericht.bremen.de/entscheidungen/entscheidungsuebersicht-11265'],
 ];
 
 const report = {
-  title: 'NS SR connectivity test — Render instance',
+  title: 'NS SR and Bremen (HB) connectivity test — Render instance',
   info: 'Single outbound probe on server startup. Browser access to this JSON never triggers new requests.',
   started_at: new Date().toISOString(),
   completed_at: null,
   region: process.env.RENDER_REGION || 'not supplied by Render',
   status: 'running',
   dns: null,
+  bremen_dns: null,
   results: [],
 };
+
+async function resolveBremenDns() {
+  const hosts = ['www.transparenz.bremen.de', 'www.oberverwaltungsgericht.bremen.de'];
+  const results = [];
+  for (const host of hosts) {
+    try {
+      results.push({ host, ok: true, addresses: await lookup(host, { all: true }) });
+    } catch (err) {
+      results.push({ host, ok: false, code: err.code || 'DNS_ERROR', message: String(err.message || err) });
+    }
+  }
+  return results;
+}
 
 async function resolveDns() {
   try {
@@ -76,6 +96,21 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'ok' }));
     return;
   }
+  // Separate read-only report for Bremen; no user-supplied URLs or live proxying.
+  if (req.url === '/bremen') {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      title: 'Bremen (HB) official-source connectivity test',
+      note: 'A HTTP 200 response confirms connectivity only, not successful legal-text extraction.',
+      started_at: report.started_at,
+      completed_at: report.completed_at,
+      region: report.region,
+      status: report.status,
+      dns: report.bremen_dns,
+      results: report.results.filter(x => x.label.startsWith('HB_')),
+    }, null, 2));
+    return;
+  }
   if (req.url !== '/' && req.url !== '/report') {
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'not found' }));
@@ -87,6 +122,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, '0.0.0.0', async () => {
   report.dns = await resolveDns();
+  report.bremen_dns = await resolveBremenDns();
   for (const [label, url] of targets) {
     report.results.push(await probe(label, url));
   }
