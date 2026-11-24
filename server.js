@@ -177,12 +177,21 @@ function authorized(req, token) {
   const b = Buffer.from('Bearer ' + token, 'utf8');
   return a.length === b.length && crypto.timingSafeEqual(a,b);
 }
+function formParamsAllowed(params) {
+  const entries=[...params];
+  return entries.length<=60 && entries.every(([k,v])=>/^[a-zA-Z0-9_.:\[\]-]{1,100}$/.test(k) && v.length<=2000 && !/[\x00-\x1f\x7f]/.test(v) && !/^(?:url|redirect|callback|target|proxy|host|password|token|authorization)$/i.test(k));
+}
 function validatedUrl(raw) {
   if (typeof raw !== 'string' || raw.length > 3000 || /[\r\n\\]/.test(raw)) return null;
   let u; try { u = new URL(raw); } catch { return null; }
   if (u.protocol !== 'https:' || u.username || u.password || u.port || u.hash) return null;
   const p = u.pathname;
-  if (u.hostname === 'www.vks.bg') return p === '/search.html' && !u.search ? u : null;
+  if (u.hostname === 'www.vks.bg') {
+    if (p === '/search.html' && !u.search) return u;
+    if (p === '/spisak-aktove.jsp' && formParamsAllowed(u.searchParams)) return u;
+    if (['/pregled-akt.jsp','/pregled-akt'].includes(p) && u.searchParams.size === 2 && ['ot-delo','ot-spisak'].includes(u.searchParams.get('type')) && /^[0-9a-f]{32}$/i.test(u.searchParams.get('id') || '')) return u;
+    return null;
+  }
   if (u.hostname === 'www.constcourt.bg') {
     if (p === '/bg/search-acts' && !u.search) return u;
     if (/^\/bg\/(?:act-\d+|case-\d+|dl-[a-f0-9]+)$/i.test(p) && !u.search) return u;
@@ -219,9 +228,9 @@ function body(req) {
     req.on('error', reject); req.on('aborted', () => reject(new Error('REQUEST_ABORTED')));
   });
 }
-function requestOfficial(u, accept) {
+function requestOfficial(u, accept, method, payload) {
   return new Promise((resolve,reject) => {
-    const req = https.request({protocol:'https:',hostname:u.hostname,port:443,path:u.pathname+u.search,method:'GET',headers:{'User-Agent':'BHGY-BG-public-source-relay/1.0',Accept:accept,'Accept-Encoding':'identity'},timeout:TIMEOUT}, response => {
+    const req = https.request({protocol:'https:',hostname:u.hostname,port:443,path:u.pathname+u.search,method,headers:{'User-Agent':'BHGY-BG-public-source-relay/1.0',Accept:accept,'Accept-Encoding':'identity',...(method==='POST'?{'Content-Type':'application/x-www-form-urlencoded','Content-Length':Buffer.byteLength(payload)}:{})},timeout:TIMEOUT}, response => {
       const chunks=[]; let size=0;
       response.on('data', c => {size+=c.length; if(size>MAX_RESPONSE) req.destroy(Object.assign(new Error('SOURCE_TOO_LARGE'),{code:'SOURCE_TOO_LARGE'})); else chunks.push(c);});
       response.on('end', () => resolve({status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks)}));
@@ -231,7 +240,7 @@ function requestOfficial(u, accept) {
     const timer=setTimeout(()=>req.destroy(Object.assign(new Error('SOURCE_TIMEOUT'),{code:'SOURCE_TIMEOUT'})),TIMEOUT);
     req.on('close',()=>clearTimeout(timer));
     req.on('timeout',()=>req.destroy(Object.assign(new Error('SOURCE_TIMEOUT'),{code:'SOURCE_TIMEOUT'})));
-    req.on('error',reject); req.end();
+    req.on('error',reject); req.end(method==='POST'?payload:undefined);
   });
 }
 async function bgRelay(req,res) {
@@ -240,13 +249,17 @@ async function bgRelay(req,res) {
   if(Buffer.byteLength(token,'utf8')<32) return send(res,503,{error:'relay not configured'});
   if(!authorized(req,token)) return send(res,401,{error:'unauthorized'});
   let input; try {input=JSON.parse(await body(req));} catch(e){return send(res,400,{error:e.message==='REQUEST_TOO_LARGE'?'request too large':'invalid request JSON'});}
-  if(!input || typeof input!=='object' || String(input.method || 'GET').toUpperCase()!=='GET' || input.payload) return send(res,400,{error:'only GET source requests allowed'});
+  if(!input || typeof input!=='object') return send(res,400,{error:'invalid request'});
+  const method=String(input.method || 'GET').toUpperCase();
+  const payload=input.payload;
+  if(!['GET','POST'].includes(method) || (method==='GET' && payload)) return send(res,400,{error:'invalid source method'});
   const u=validatedUrl(input.url);
   if(!u) return send(res,400,{error:'source URL not allowed'});
+  if(method==='POST' && !(u.hostname==='www.vks.bg' && u.pathname==='/spisak-aktove.jsp' && !u.search && typeof payload==='string' && payload.length<=8000 && payload.length>0 && formParamsAllowed(new URLSearchParams(payload)))) return send(res,400,{error:'form submission not allowed'});
   const rawAccept=String((input.headers||{}).Accept || '*/*');
   const accept=/^[\w\s,;.*\/+=-]{1,150}$/.test(rawAccept) && !/[\r\n]/.test(rawAccept)?rawAccept:'*/*';
   try {
-    const upstream=await requestOfficial(u,accept);
+    const upstream=await requestOfficial(u,accept,method,payload);
     if(res.destroyed) return;
     const h={'Content-Type':upstream.headers['content-type']||'application/octet-stream','Cache-Control':'no-store','X-BG-Proxy':'bg-courts-v1','X-BG-Upstream-Status':String(upstream.status)};
     if(upstream.headers['content-encoding']) h['Content-Encoding']=upstream.headers['content-encoding'];
@@ -259,7 +272,7 @@ return bgRelay;
 
 })();
 const server=http.createServer((req,res)=>{
-  if(req.url==='/api/bg-courts') {void bgCourtsRelay(req,res);return;}
+  if(req.url==='/api/bg-courts' || (req.method==='GET' && req.url.split('?')[0]==='/api/bg-courts')) {void bgCourtsRelay(req,res);return;}
   if(req.url==='/api/nssr') {void relay(req,res);return;}
   if(req.url==='/health')return json(res,200,{status:'ok',relay_configured:Boolean(TOKEN && Buffer.byteLength(TOKEN,'utf8')>=32)});
   if(req.url==='/bremen')return json(res,200,{
