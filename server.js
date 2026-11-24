@@ -5,7 +5,6 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const {lookup} = require('node:dns').promises;
-
 const PORT = Number(process.env.PORT || 10000);
 const TOKEN = String(process.env.NSSR_PROXY_TOKEN || '');
 const MAX_REQUEST_BYTES = 12 * 1024;
@@ -29,7 +28,6 @@ const report = {
   region: process.env.RENDER_REGION || 'not supplied by Render',
   status: 'running', dns: null, bremen_dns: null, results: []
 };
-
 async function resolveDns() {
   try { return {ok:true,addresses:await lookup('www.nsud.sk',{all:true})}; }
   catch(err) { return {ok:false,code:err.code || 'DNS_ERROR',message:String(err.message || err)}; }
@@ -159,7 +157,109 @@ async function relay(req,res) {
     res.end(upstream.body);
   }catch(err){return json(res,502,{error:'official source fetch failed',reason:String(err.message || 'NETWORK_ERROR').slice(0,100)});}
 }
+// Bulgaria court relay — isolated namespace, same server and token.
+const bgCourtsRelay = (() => {
+'use strict';
+// Additive Bulgaria transport for the existing Frankfurt server. No dependencies.
+// Only public, already identified court endpoints. No redirects, cookies or credentials upstream.
+const https = require('node:https');
+const crypto = require('node:crypto');
+const MAX_REQUEST = 12 * 1024;
+const MAX_RESPONSE = 16 * 1024 * 1024;
+const TIMEOUT = 22000;
+function send(res, code, data) {
+  if (res.destroyed || res.headersSent) return;
+  res.writeHead(code, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
+  res.end(JSON.stringify(data));
+}
+function authorized(req, token) {
+  const a = Buffer.from(String(req.headers.authorization || ''), 'utf8');
+  const b = Buffer.from('Bearer ' + token, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a,b);
+}
+function validatedUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 3000 || /[\r\n\\]/.test(raw)) return null;
+  let u; try { u = new URL(raw); } catch { return null; }
+  if (u.protocol !== 'https:' || u.username || u.password || u.port || u.hash) return null;
+  const p = u.pathname;
+  if (u.hostname === 'www.vks.bg') return p === '/search.html' && !u.search ? u : null;
+  if (u.hostname === 'www.constcourt.bg') {
+    if (p === '/bg/search-acts' && !u.search) return u;
+    if (/^\/bg\/(?:act-\d+|case-\d+|dl-[a-f0-9]+)$/i.test(p) && !u.search) return u;
+    if (p !== '/') return null;
+    const keys = ['mode','year','number','act_type','judge','status','search'];
+    if ([...u.searchParams.keys()].some(k => !keys.includes(k))) return null;
+    if (u.searchParams.getAll('mode').length !== 1 || !['search_acts','search_cases'].includes(u.searchParams.get('mode'))) return null;
+    return u;
+  }
+  if (u.hostname === 'sac.justice.bg') {
+    const base = '/wp-json/vas/v1/edis/';
+    if (!p.startsWith(base)) return null;
+    const endpoint = p.slice(base.length);
+    if (endpoint === 'bodies' || /^cases\/[a-zA-Z0-9_-]{1,100}$/.test(endpoint)) return !u.search ? u : null;
+    if (endpoint === 'search') {
+      const keys = ['reference_no','year','inst','predmet','material','department_id','reg_no','reg_year','kind','doc_type','appealed_case_no','appealed_case_year','administrative_body','ot_data','do_data','order','q','limit','offset'];
+      return [...u.searchParams.keys()].every(k => keys.includes(k)) ? u : null;
+    }
+    if (endpoint === 'document' || endpoint === 'document/pdf') {
+      if ([...u.searchParams.keys()].length !== 1 || u.searchParams.getAll('url').length !== 1) return null;
+      const rawNested = u.searchParams.get('url');
+      if (!/^https:\/\/info-adc\.justice\.bg\/courts\/portal\/edis\.nsf\/e_(?:act|document|protocol|reportslist)\.xsp\?[^#\s\\]+$/i.test(rawNested)) return null;
+      let nested; try { nested = new URL(rawNested); } catch { return null; }
+      return nested.hostname === 'info-adc.justice.bg' && !nested.username && !nested.password && !nested.port && !nested.hash ? u : null;
+    }
+  }
+  return null;
+}
+function body(req) {
+  return new Promise((resolve,reject) => {
+    const chunks=[]; let size=0, tooLarge=false;
+    req.on('data', c => { size += c.length; if(size > MAX_REQUEST) {tooLarge=true; chunks.length=0;} else if(!tooLarge) chunks.push(c); });
+    req.on('end', () => tooLarge ? reject(new Error('REQUEST_TOO_LARGE')) : resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject); req.on('aborted', () => reject(new Error('REQUEST_ABORTED')));
+  });
+}
+function requestOfficial(u, accept) {
+  return new Promise((resolve,reject) => {
+    const req = https.request({protocol:'https:',hostname:u.hostname,port:443,path:u.pathname+u.search,method:'GET',headers:{'User-Agent':'BHGY-BG-public-source-relay/1.0',Accept:accept,'Accept-Encoding':'identity'},timeout:TIMEOUT}, response => {
+      const chunks=[]; let size=0;
+      response.on('data', c => {size+=c.length; if(size>MAX_RESPONSE) req.destroy(Object.assign(new Error('SOURCE_TOO_LARGE'),{code:'SOURCE_TOO_LARGE'})); else chunks.push(c);});
+      response.on('end', () => resolve({status:response.statusCode,headers:response.headers,body:Buffer.concat(chunks)}));
+      response.on('aborted',()=>reject(Object.assign(new Error('SOURCE_ABORTED'),{code:'SOURCE_ABORTED'})));
+      response.on('error',reject);
+    });
+    const timer=setTimeout(()=>req.destroy(Object.assign(new Error('SOURCE_TIMEOUT'),{code:'SOURCE_TIMEOUT'})),TIMEOUT);
+    req.on('close',()=>clearTimeout(timer));
+    req.on('timeout',()=>req.destroy(Object.assign(new Error('SOURCE_TIMEOUT'),{code:'SOURCE_TIMEOUT'})));
+    req.on('error',reject); req.end();
+  });
+}
+async function bgRelay(req,res) {
+  if(req.method!=='POST') return send(res,405,{error:'method not allowed',relay:'bg-courts-v1'});
+  const token=String(process.env.NSSR_PROXY_TOKEN || '');
+  if(Buffer.byteLength(token,'utf8')<32) return send(res,503,{error:'relay not configured'});
+  if(!authorized(req,token)) return send(res,401,{error:'unauthorized'});
+  let input; try {input=JSON.parse(await body(req));} catch(e){return send(res,400,{error:e.message==='REQUEST_TOO_LARGE'?'request too large':'invalid request JSON'});}
+  if(!input || typeof input!=='object' || String(input.method || 'GET').toUpperCase()!=='GET' || input.payload) return send(res,400,{error:'only GET source requests allowed'});
+  const u=validatedUrl(input.url);
+  if(!u) return send(res,400,{error:'source URL not allowed'});
+  const rawAccept=String((input.headers||{}).Accept || '*/*');
+  const accept=/^[\w\s,;.*\/+=-]{1,150}$/.test(rawAccept) && !/[\r\n]/.test(rawAccept)?rawAccept:'*/*';
+  try {
+    const upstream=await requestOfficial(u,accept);
+    if(res.destroyed) return;
+    const h={'Content-Type':upstream.headers['content-type']||'application/octet-stream','Cache-Control':'no-store','X-BG-Proxy':'bg-courts-v1','X-BG-Upstream-Status':String(upstream.status)};
+    if(upstream.headers['content-encoding']) h['Content-Encoding']=upstream.headers['content-encoding'];
+    // No redirect following and no upstream cookies. Preserve status for diagnostics.
+    if(upstream.headers.location && /^[\x20-\x7e]{1,1000}$/.test(upstream.headers.location)) h['X-BG-Upstream-Location']=upstream.headers.location;
+    res.writeHead(upstream.status,h); res.end(upstream.body);
+  } catch(e) { return send(res,502,{error:'official source fetch failed',reason:String(e.code||'NETWORK_ERROR').slice(0,80)}); }
+}
+return bgRelay;
+
+})();
 const server=http.createServer((req,res)=>{
+  if(req.url==='/api/bg-courts') {void bgCourtsRelay(req,res);return;}
   if(req.url==='/api/nssr') {void relay(req,res);return;}
   if(req.url==='/health')return json(res,200,{status:'ok',relay_configured:Boolean(TOKEN && Buffer.byteLength(TOKEN,'utf8')>=32)});
   if(req.url==='/bremen')return json(res,200,{
